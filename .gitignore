@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+### 本地运行时数据（WAL 流水） ###
+/data/
