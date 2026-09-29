@@ -1,5 +1,7 @@
 package com.github.lisama569.ordermatchingenginejava.risk;
 
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.Order;
 import com.github.lisama569.ordermatchingenginejava.model.OrderType;
 import com.github.lisama569.ordermatchingenginejava.model.RejectReason;
 import com.github.lisama569.ordermatchingenginejava.model.SubmitOrderRequest;
@@ -54,6 +56,40 @@ public final class RiskValidator {
             }
         } else {
             return RejectReason.INVALID_ARGUMENT;
+        }
+        return null;
+    }
+
+    /**
+     * 改单静态校验。价格刻度按订单类型区分（限价=INVALID_PRICE，
+     * 市价=INVALID_PROTECTION_PRICE）；数量必须为正、整手且大于已成交量。
+     * 返回拒因；通过返回 null。
+     */
+    public RejectReason validateModify(ModifyOrderRequest req, Order order) {
+        if (req == null || order == null
+                || isBlank(req.amendId()) || isBlank(req.accountId())
+                || isBlank(req.clientOrderId())) {
+            return RejectReason.INVALID_ARGUMENT;
+        }
+        if (req.newPrice() == null && req.newQuantity() == null) {
+            return RejectReason.MODIFY_NOTHING;
+        }
+        if (req.newPrice() != null) {
+            long p = req.newPrice();
+            if (p <= 0 || p % tickSize != 0) {
+                return order.getType() == OrderType.MARKET
+                        ? RejectReason.INVALID_PROTECTION_PRICE
+                        : RejectReason.INVALID_PRICE;
+            }
+        }
+        if (req.newQuantity() != null) {
+            long q = req.newQuantity();
+            if (q <= 0 || q % lotSize != 0) {
+                return RejectReason.INVALID_QUANTITY;
+            }
+            if (q <= order.getFilledQty()) {
+                return RejectReason.MODIFY_QTY_BELOW_FILLED;
+            }
         }
         return null;
     }

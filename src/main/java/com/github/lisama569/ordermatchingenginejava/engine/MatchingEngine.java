@@ -4,6 +4,8 @@ import com.github.lisama569.ordermatchingenginejava.account.AccountLedger;
 import com.github.lisama569.ordermatchingenginejava.model.CancelOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Fill;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Order;
 import com.github.lisama569.ordermatchingenginejava.model.OrderStatus;
 import com.github.lisama569.ordermatchingenginejava.model.OrderType;
@@ -51,6 +53,8 @@ public final class MatchingEngine {
     private final Map<String, Order> byClientOrderId = new HashMap<>();
     private final Map<String, SubmitOrderResult> submitResults = new HashMap<>();
     private final Map<String, CancelOrderResult> cancelResults = new HashMap<>();
+    /** 改单幂等表：键 = accountId|clientOrderId|amendId。 */
+    private final Map<String, ModifyOrderResult> modifyResults = new HashMap<>();
     /** symbol -> 下一个期望行情序号（首个接受的序号必须为 1）。 */
     private final Map<String, Long> expectedTickSeq = new HashMap<>();
     private final List<Fill> fills = new ArrayList<>();
@@ -58,6 +62,54 @@ public final class MatchingEngine {
     private final AtomicLong orderSeq = new AtomicLong(0);
     private final AtomicLong fillSeq = new AtomicLong(0);
     private Consumer<Fill> fillListener = f -> { };
+    /**
+     * 在线写路径钩子：命令在锁内、首个状态判定点原子触发一次（追加 WAL）。
+     * 为 null（引擎直调/回放）时不写日志。这样 WAL 顺序与锁内执行顺序严格一致，
+     * 并发下回放才能复现相同的入队/改单排队序号。
+     */
+    private Runnable journalHook;
+
+    /** 供 OrderService 使用：在同一把引擎锁内先持久化命令、再执行命令。 */
+    public SubmitOrderResult submit(SubmitOrderRequest req, Runnable journalHook) {
+        lock.lock();
+        try {
+            this.journalHook = journalHook;
+            return submit(req);
+        } finally {
+            this.journalHook = null;
+            lock.unlock();
+        }
+    }
+
+    /** 供 OrderService 使用：撤单的"持久化 + 执行"原子化。 */
+    public CancelOrderResult cancel(String accountId, String clientOrderId, Runnable journalHook) {
+        lock.lock();
+        try {
+            this.journalHook = journalHook;
+            return cancel(accountId, clientOrderId);
+        } finally {
+            this.journalHook = null;
+            lock.unlock();
+        }
+    }
+
+    /** 供 OrderService 使用：改单的"持久化 + 执行"原子化。 */
+    public ModifyOrderResult modify(ModifyOrderRequest req, Runnable journalHook) {
+        lock.lock();
+        try {
+            this.journalHook = journalHook;
+            return modify(req);
+        } finally {
+            this.journalHook = null;
+            lock.unlock();
+        }
+    }
+
+    private void fireJournalHook() {
+        if (journalHook != null) {
+            journalHook.run();
+        }
+    }
 
     public MatchingEngine(AccountLedger ledger, long tickSize, long lotSize) {
         this.ledger = ledger;
@@ -85,6 +137,7 @@ public final class MatchingEngine {
     public SubmitOrderResult submit(SubmitOrderRequest req) {
         lock.lock();
         try {
+            fireJournalHook();
             SubmitOrderResult first = submitResults.get(req.clientOrderId());
             if (first != null) {
                 log.info("[submit] idempotent-hit clientOrderId={} accepted={} orderId={} reason={}",
@@ -162,6 +215,7 @@ public final class MatchingEngine {
     public CancelOrderResult cancel(String accountId, String clientOrderId) {
         lock.lock();
         try {
+            fireJournalHook();
             String key = accountId + '|' + clientOrderId;
             CancelOrderResult first = cancelResults.get(key);
             if (first != null) {
@@ -213,14 +267,138 @@ public final class MatchingEngine {
         return r;
     }
 
+    /**
+     * 改单（命令已由上层写入 WAL）。
+     *
+     * <p>对仍在订单簿中的挂单直接改价 / 改量：
+     * <ul>
+     *   <li>幂等：键 {@code accountId|clientOrderId|amendId}，重复提交返回首次结果；</li>
+     *   <li>拒因可区分：订单不存在 / 属主不符 / 已终结 / 静态非法 / 额度不足；</li>
+     *   <li>占用守恒：增量申请原子校验，不足则原单价格、数量、占用一点不变；
+     *       减量立即释放多占部分；</li>
+     *   <li>排队：改了价（含市价保护价）按改单时刻重新发号入队，失去原时间优先；
+     *       只改量（无论增减）保留原 enqueueSeq，排队先后不变。</li>
+     * </ul>
+     */
+    public ModifyOrderResult modify(ModifyOrderRequest req) {
+        lock.lock();
+        try {
+            fireJournalHook();
+            String key = req.accountId() + '|' + req.clientOrderId() + '|' + req.amendId();
+            ModifyOrderResult first = modifyResults.get(key);
+            if (first != null) {
+                log.info("[modify] idempotent-hit amendId={} clientOrderId={} success={} reason={}",
+                        req.amendId(), req.clientOrderId(), first.success(), first.rejectReason());
+                return new ModifyOrderResult(first.success(), true, first.orderId(), first.status(),
+                        first.price(), first.quantity(), first.rejectReason(), first.message());
+            }
+
+            Order order = byClientOrderId.get(req.clientOrderId());
+            if (order == null) {
+                return rejectModify(key, null, OrderStatus.REJECTED, 0, 0,
+                        RejectReason.ORDER_NOT_FOUND, "order not found", req);
+            }
+            if (!order.getAccountId().equals(req.accountId())) {
+                return rejectModify(key, order.getOrderId(), order.getStatus(),
+                        order.getPrice(), order.getOriginalQty(),
+                        RejectReason.ORDER_OWNER_MISMATCH, "order belongs to another account", req);
+            }
+            if (order.getStatus() != OrderStatus.NEW && order.getStatus() != OrderStatus.PARTIALLY_FILLED) {
+                return rejectModify(key, order.getOrderId(), order.getStatus(),
+                        order.getPrice(), order.getOriginalQty(),
+                        RejectReason.ORDER_NOT_MODIFIABLE,
+                        "order status " + order.getStatus() + " is not modifiable", req);
+            }
+
+            RejectReason invalid = risk.validateModify(req, order);
+            if (invalid != null) {
+                return rejectModify(key, order.getOrderId(), order.getStatus(),
+                        order.getPrice(), order.getOriginalQty(), invalid,
+                        "static risk check failed", req);
+            }
+
+            long oldPrice = order.getPrice();
+            long newPrice = req.newPrice() != null ? req.newPrice() : oldPrice;
+            long oldRemaining = order.remainingQty();
+            long newRemaining = req.newQuantity() != null
+                    ? req.newQuantity() - order.getFilledQty() : oldRemaining;
+
+            // 占用增量按"剩余部分"的名义金额计算；不足时台账零改动，改单整体拒绝
+            boolean adjusted;
+            if (order.getSide() == Side.BUY) {
+                long delta = newRemaining * newPrice - oldRemaining * oldPrice;
+                adjusted = ledger.adjustBuyReserve(order.getAccountId(), order.getSymbol(), delta);
+            } else {
+                long deltaQty = newRemaining - oldRemaining;
+                long deltaNotional = newRemaining * newPrice - oldRemaining * oldPrice;
+                adjusted = ledger.adjustSellReserve(order.getAccountId(), order.getSymbol(),
+                        deltaQty, deltaNotional);
+            }
+            if (!adjusted) {
+                return rejectModify(key, order.getOrderId(), order.getStatus(), oldPrice,
+                        order.getOriginalQty(), RejectReason.EXPOSURE_LIMIT_EXCEEDED,
+                        "insufficient cash/position or exposure limit exceeded", req);
+            }
+
+            // 占用调整完成后再动订单与队列：改价 => 先出队、改价、重新发号、重新入队；
+            // 仅改量 => 原地更新字段，保持原排队位置（堆顺序与量无关）
+            boolean priceChanged = newPrice != oldPrice;
+            if (priceChanged) {
+                book(order.getSymbol()).remove(order);
+                order.setPrice(newPrice);
+                order.setEnqueueSeq(enqueueSeq.incrementAndGet());
+                book(order.getSymbol()).add(order);
+            }
+            if (req.newQuantity() != null) {
+                order.setOriginalQty(req.newQuantity());
+            }
+
+            ModifyOrderResult ok = new ModifyOrderResult(true, false, order.getOrderId(),
+                    order.getStatus(), newPrice, order.getOriginalQty(), null,
+                    "order modified" + (priceChanged ? ", re-queued at tail priority"
+                            : ", queue position preserved"));
+            modifyResults.put(key, ok);
+            log.info("[modify] accepted amendId={} orderId={} account={} clientOrderId={} price {}->{} totalQty={} remaining {}->{} priceChanged={} enqueueSeq={}",
+                    req.amendId(), order.getOrderId(), req.accountId(), req.clientOrderId(),
+                    oldPrice, newPrice, order.getOriginalQty(), oldRemaining, newRemaining,
+                    priceChanged, order.getEnqueueSeq());
+            return ok;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private ModifyOrderResult rejectModify(String key, Long orderId, OrderStatus status,
+                                           long price, long quantity, RejectReason reason,
+                                           String message, ModifyOrderRequest req) {
+        ModifyOrderResult r = new ModifyOrderResult(false, false, orderId, status,
+                price, quantity, reason, message);
+        modifyResults.put(key, r);
+        log.warn("[modify] rejected amendId={} account={} clientOrderId={} newPrice={} newQty={} reason={} because={}",
+                req.amendId(), req.accountId(), req.clientOrderId(), req.newPrice(),
+                req.newQuantity(), reason, message);
+        return r;
+    }
+
     /** 按订单剩余数量释放挂单时的冻结与敞口。 */
-    private void releaseRemainder(Order order) {
-        long remaining = order.remainingQty();
+    private void releaseRemainder(Order order) {        long remaining = order.remainingQty();
         long notional = remaining * order.getPrice();
         if (order.getSide() == Side.BUY) {
             ledger.releaseBuy(order.getAccountId(), order.getSymbol(), notional);
         } else {
             ledger.releaseSell(order.getAccountId(), order.getSymbol(), remaining, notional);
+        }
+    }
+
+    /** 供 OrderService 使用：行情的"持久化 + 撮合"原子化。 */
+    public TickResult onTick(MarketTick tick, Runnable journalHook) {
+        lock.lock();
+        try {
+            this.journalHook = journalHook;
+            return onTick(tick);
+        } finally {
+            this.journalHook = null;
+            lock.unlock();
         }
     }
 
@@ -232,6 +410,7 @@ public final class MatchingEngine {
     public TickResult onTick(MarketTick tick) {
         lock.lock();
         try {
+            fireJournalHook();
             long expected = expectedTickSeq.getOrDefault(tick.symbol(), 1L);
             if (tick.seq() < expected) {
                 RejectReason reason = tick.seq() == expected - 1

@@ -22,6 +22,12 @@ public enum RejectReason {
     ORDER_OWNER_MISMATCH,
     /** 订单已成交/已撤销/已拒单，不可撤销。 */
     ORDER_NOT_CANCELLABLE,
+    /** 订单已全部成交/已撤销/已拒单，不可改单。 */
+    ORDER_NOT_MODIFIABLE,
+    /** 改单未提供新价格与新数量（至少要改一项）。 */
+    MODIFY_NOTHING,
+    /** 改单后的新数量不大于已成交量（剩余数量必须为正）。 */
+    MODIFY_QTY_BELOW_FILLED,
     /** 行情序号重复。 */
     TICK_DUPLICATE,
     /** 行情序号乱序（小于下一个期望序号）。 */

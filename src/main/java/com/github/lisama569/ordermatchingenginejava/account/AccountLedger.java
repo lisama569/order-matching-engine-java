@@ -142,9 +142,68 @@ public final class AccountLedger {
         c[0] += proceeds;
     }
 
+    /**
+     * 改单：调整买单剩余部分冻结的现金与敞口。
+     *
+     * <p>{@code delta > 0}（改单需要更多占用）时先检查可用现金与敞口，
+     * 任一不足则返回 false 且<b>零改动</b>（改单整体拒绝）；
+     * {@code delta < 0}（需求减少）时立即释放多占部分；{@code delta == 0} 不动。
+     */
+    public boolean adjustBuyReserve(String accountId, String symbol, long delta) {
+        if (delta == 0) {
+            return true;
+        }
+        long[] c = cashOf(accountId);
+        long[] d = dimOf(accountId, symbol);
+        if (delta > 0) {
+            if (c[0] - c[1] < delta || d[3] - d[2] < delta) {
+                return false;
+            }
+            c[1] += delta;
+            d[2] += delta;
+        } else {
+            long release = -delta;
+            if (c[1] < release || d[2] < release) {
+                throw new IllegalStateException("buy modify release exceeds reservation: " + release);
+            }
+            c[1] -= release;
+            d[2] -= release;
+        }
+        return true;
+    }
+
+    /**
+     * 改单：调整卖单剩余部分冻结的持仓与敞口。
+     *
+     * @param deltaQty      持仓冻结增量（正=需要更多持仓，负=释放多冻持仓）
+     * @param deltaNotional 敞口增量（正=需要更多敞口，负=释放多占敞口）
+     * @return true 表示调整完成；false 表示可用持仓/敞口不足，状态零改动
+     */
+    public boolean adjustSellReserve(String accountId, String symbol,
+                                     long deltaQty, long deltaNotional) {
+        if (deltaQty == 0 && deltaNotional == 0) {
+            return true;
+        }
+        long[] d = dimOf(accountId, symbol);
+        long needQty = Math.max(deltaQty, 0);
+        long needNotional = Math.max(deltaNotional, 0);
+        long releaseQty = Math.max(-deltaQty, 0);
+        long releaseNotional = Math.max(-deltaNotional, 0);
+        // 正增量（量增/敞口增）先校验可用额度，任一不足 => 零改动
+        if (d[0] - d[1] < needQty || d[3] - d[2] < needNotional) {
+            return false;
+        }
+        // 负增量（释放）不得超过当前冻结，超出即说明台账不一致
+        if (d[1] < releaseQty || d[2] < releaseNotional) {
+            throw new IllegalStateException("sell modify release exceeds reservation: qty=" + releaseQty);
+        }
+        d[1] += deltaQty;
+        d[2] += deltaNotional;
+        return true;
+    }
+
     /** 买单剩余冻结的释放（撤单 / 拒单 / 订单终结时）。 */
-    public void releaseBuy(String accountId, String symbol, long amount) {
-        if (amount == 0) {
+    public void releaseBuy(String accountId, String symbol, long amount) {        if (amount == 0) {
             return;
         }
         long[] c = cashOf(accountId);

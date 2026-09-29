@@ -10,6 +10,8 @@ import com.github.lisama569.ordermatchingenginejava.market.SimulatedMarketFeeder
 import com.github.lisama569.ordermatchingenginejava.model.CancelOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Fill;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Order;
 import com.github.lisama569.ordermatchingenginejava.model.SubmitOrderRequest;
 import com.github.lisama569.ordermatchingenginejava.model.SubmitOrderResult;
@@ -22,7 +24,9 @@ import java.util.List;
 /**
  * 应用编排层。
  *
- * <p>写路径（在线）：命令<b>先追加 WAL、后执行</b>（write-ahead）。
+ * <p>写路径（在线）：命令在引擎锁内、首个状态判定点<b>先追加 WAL、后执行</b>（write-ahead）。
+ * 持久化与执行共用引擎同一把锁，保证 WAL 顺序 == 实际执行顺序，
+ * 因此并发命令（含改价重排队）重启回放后排队序号与撮合结论完全一致。
  * 重复提交 / 非法行情等会被幂等表或序号校验拦截，重放时产生完全相同的拦截结论，
  * 因此"先写日志再拒绝"不会改变任何状态，保证重放确定性。
  *
@@ -52,27 +56,37 @@ public final class OrderService {
     }
 
     public SubmitOrderResult submit(SubmitOrderRequest req) {
-        journal.append(JournalEvent.submit(req));
-        SubmitOrderResult result = engine.submit(req);
+        SubmitOrderResult result = engine.submit(req,
+                () -> journal.append(JournalEvent.submit(req)));
         log.info("[service] submit clientOrderId={} accepted={} duplicate={} reason={}",
                 req.clientOrderId(), result.accepted(), result.duplicate(), result.rejectReason());
         return result;
     }
 
     public CancelOrderResult cancel(String accountId, String clientOrderId) {
-        journal.append(JournalEvent.cancel(accountId, clientOrderId));
-        CancelOrderResult result = engine.cancel(accountId, clientOrderId);
+        CancelOrderResult result = engine.cancel(accountId, clientOrderId,
+                () -> journal.append(JournalEvent.cancel(accountId, clientOrderId)));
         log.info("[service] cancel account={} clientOrderId={} success={} duplicate={} reason={}",
                 accountId, clientOrderId, result.success(), result.duplicate(), result.rejectReason());
         return result;
     }
 
-    /** 行情入口（由 MarketDataService 回调）：先持久化、后撮合。 */
+    /** 改单入口：持久化与执行在引擎锁内原子完成（与下单/撤单/行情同一份 WAL）。 */
+    public ModifyOrderResult modify(ModifyOrderRequest req) {
+        ModifyOrderResult result = engine.modify(req,
+                () -> journal.append(JournalEvent.modify(req)));
+        log.info("[service] modify amendId={} account={} clientOrderId={} success={} duplicate={} reason={}",
+                req.amendId(), req.accountId(), req.clientOrderId(),
+                result.success(), result.duplicate(), result.rejectReason());
+        return result;
+    }
+
+    /** 行情入口（由 MarketDataService 回调）：持久化与撮合在引擎锁内原子完成。 */
     public TickResult acceptTick(MarketTick tick) {
-        if (!replaying) {
-            journal.append(JournalEvent.tick(tick));
+        if (replaying) {
+            return engine.onTick(tick);
         }
-        return engine.onTick(tick);
+        return engine.onTick(tick, () -> journal.append(JournalEvent.tick(tick)));
     }
 
     /**
@@ -87,7 +101,7 @@ public final class OrderService {
         replaying = true;
         try {
             List<JournalEvent> events = journal.readAll();
-            int submits = 0, cancels = 0, ticks = 0;
+            int submits = 0, cancels = 0, modifies = 0, ticks = 0;
             for (JournalEvent e : events) {
                 switch (e.type()) {
                     case SUBMIT -> {
@@ -98,6 +112,10 @@ public final class OrderService {
                         engine.cancel(e.cancelAccountId(), e.cancelClientOrderId());
                         cancels++;
                     }
+                    case MODIFY -> {
+                        engine.modify(e.modify());
+                        modifies++;
+                    }
                     case TICK -> {
                         TickResult r = engine.onTick(e.tick());
                         marketDataService.resetExpectedSeq(e.tick().symbol(), r.expectedSeq());
@@ -105,8 +123,8 @@ public final class OrderService {
                     }
                 }
             }
-            log.info("[service] replay done events={} (submits={}, cancels={}, ticks={})",
-                    events.size(), submits, cancels, ticks);
+            log.info("[service] replay done events={} (submits={}, cancels={}, modifies={}, ticks={})",
+                    events.size(), submits, cancels, modifies, ticks);
             return events.size();
         } finally {
             replaying = false;

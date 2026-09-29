@@ -3,13 +3,18 @@ package com.github.lisama569.ordermatchingenginejava.tests;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+
+import java.nio.file.Path;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -17,8 +22,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * REST 端到端：HTTP 状态码 + 可区分拒因 + 幂等标记 + 行情序号拒绝。
- * 注意：本测试依赖默认种子账户 alice/bob 与标的 AAPL，且与其他用例共享
- * target/test-data/journal.jsonl；断言只依赖拒因/标志，不依赖历史计数。
+ * WAL 落在每次运行独立的临时目录，保证用例可连续重复执行、不依赖历史文件。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -26,6 +30,15 @@ class WebIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(WebIntegrationTest.class);
     private static final ObjectMapper M = new ObjectMapper();
+
+    @TempDir
+    static Path tempDir;
+
+    @DynamicPropertySource
+    static void journalProps(DynamicPropertyRegistry registry) {
+        registry.add("matching.journal-path",
+                () -> tempDir.resolve("web-journal.jsonl").toString());
+    }
 
     @Autowired
     private MockMvc mvc;
@@ -106,5 +119,53 @@ class WebIntegrationTest {
                 .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
         log.info("[web] 重复撤单: duplicate={}", M.readTree(cancelDup).get("duplicate").asBoolean());
         org.junit.jupiter.api.Assertions.assertTrue(M.readTree(cancelDup).get("duplicate").asBoolean());
+
+        // ---- 改单端到端 ----
+        // bob 再下一笔买单 web-buy-2：10@100 冻结1000，随后改价到 101 => 冻结1010
+        String buy2 = orderJson("web-buy-2", "bob", "BUY", "LIMIT", 100L, null, 10);
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON).content(buy2))
+                .andExpect(status().isOk());
+        String modify = M.createObjectNode()
+                .put("amendId", "web-am-1").put("accountId", "bob").put("clientOrderId", "web-buy-2")
+                .put("newPrice", 101).put("newQuantity", 10).toString();
+        String modResp = mvc.perform(post("/api/orders/modify").contentType(MediaType.APPLICATION_JSON).content(modify))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        JsonNode modJson = M.readTree(modResp);
+        org.junit.jupiter.api.Assertions.assertTrue(modJson.get("success").asBoolean());
+        org.junit.jupiter.api.Assertions.assertFalse(modJson.get("duplicate").asBoolean());
+        org.junit.jupiter.api.Assertions.assertEquals(101, modJson.get("price").asLong());
+        log.info("[web] 改价成功: success={} price={}", modJson.get("success").asBoolean(),
+                modJson.get("price").asLong());
+
+        // 同 amendId 重复 => 200 + duplicate=true
+        String modDup = mvc.perform(post("/api/orders/modify").contentType(MediaType.APPLICATION_JSON).content(modify))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertTrue(M.readTree(modDup).get("duplicate").asBoolean());
+
+        // 只减量 10->5：冻结降到 5*101=505
+        String modDown = M.createObjectNode()
+                .put("amendId", "web-am-2").put("accountId", "bob").put("clientOrderId", "web-buy-2")
+                .put("newQuantity", 5).toString();
+        mvc.perform(post("/api/orders/modify").contentType(MediaType.APPLICATION_JSON).content(modDown))
+                .andExpect(status().isOk());
+        String exp2 = mvc.perform(get("/api/accounts/bob/symbols/AAPL/exposure"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertEquals(505, M.readTree(exp2).get("cashReserved").asLong());
+        log.info("[web] 改单减量后 cashReserved=505");
+
+        // 不存在的订单 => 422 + ORDER_NOT_FOUND
+        String modMissing = M.createObjectNode()
+                .put("amendId", "web-am-x").put("accountId", "bob").put("clientOrderId", "no-such")
+                .put("newPrice", 101).toString();
+        String missResp = mvc.perform(post("/api/orders/modify").contentType(MediaType.APPLICATION_JSON).content(modMissing))
+                .andExpect(status().isUnprocessableEntity()).andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertEquals("ORDER_NOT_FOUND",
+                M.readTree(missResp).get("rejectReason").asText());
+
+        // 参数错误：既不给价也不给量 => 400
+        String modEmpty = M.createObjectNode()
+                .put("amendId", "web-am-e").put("accountId", "bob").put("clientOrderId", "web-buy-2").toString();
+        mvc.perform(post("/api/orders/modify").contentType(MediaType.APPLICATION_JSON).content(modEmpty))
+                .andExpect(status().isBadRequest());
     }
 }

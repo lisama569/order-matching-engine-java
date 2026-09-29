@@ -3,11 +3,14 @@ package com.github.lisama569.ordermatchingenginejava.api;
 import com.github.lisama569.ordermatchingenginejava.account.AccountLedger;
 import com.github.lisama569.ordermatchingenginejava.account.AccountSnapshot;
 import com.github.lisama569.ordermatchingenginejava.api.dto.CancelOrderDto;
+import com.github.lisama569.ordermatchingenginejava.api.dto.ModifyOrderDto;
 import com.github.lisama569.ordermatchingenginejava.api.dto.SubmitOrderDto;
 import com.github.lisama569.ordermatchingenginejava.api.dto.TickDto;
 import com.github.lisama569.ordermatchingenginejava.model.CancelOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Fill;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.ModifyOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Order;
 import com.github.lisama569.ordermatchingenginejava.model.OrderType;
 import com.github.lisama569.ordermatchingenginejava.model.Side;
@@ -61,6 +64,32 @@ public class OrderController {
         requireText(dto.accountId(), "accountId");
         requireText(dto.clientOrderId(), "clientOrderId");
         CancelOrderResult result = orderService.cancel(dto.accountId(), dto.clientOrderId());
+        HttpStatus status = result.success() ? HttpStatus.OK : HttpStatus.UNPROCESSABLE_ENTITY;
+        return ResponseEntity.status(status).body(result);
+    }
+
+    /**
+     * 改单（幂等：相同 amendId 重复提交返回首次结果，只生效一次）。
+     * 改价按改单时刻重新排队、失去原时间优先；只改量保留原排队位置。
+     */
+    @PostMapping("/orders/modify")
+    public ResponseEntity<ModifyOrderResult> modify(@RequestBody ModifyOrderDto dto) {
+        log.info("[api] POST /orders/modify body={}", dto);
+        requireText(dto.amendId(), "amendId");
+        requireText(dto.accountId(), "accountId");
+        requireText(dto.clientOrderId(), "clientOrderId");
+        if (dto.newPrice() == null && dto.newQuantity() == null) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "newPrice or newQuantity is required");
+        }
+        if (dto.newQuantity() != null && dto.newQuantity() <= 0) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "newQuantity must be positive");
+        }
+        if (dto.newPrice() != null && dto.newPrice() <= 0) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "newPrice must be positive");
+        }
+        ModifyOrderResult result = orderService.modify(new ModifyOrderRequest(
+                dto.amendId(), dto.accountId(), dto.clientOrderId(),
+                dto.newPrice(), dto.newQuantity()));
         HttpStatus status = result.success() ? HttpStatus.OK : HttpStatus.UNPROCESSABLE_ENTITY;
         return ResponseEntity.status(status).body(result);
     }
