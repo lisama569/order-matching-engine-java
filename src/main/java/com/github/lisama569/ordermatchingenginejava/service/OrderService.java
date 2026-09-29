@@ -7,6 +7,8 @@ import com.github.lisama569.ordermatchingenginejava.journal.EventJournal;
 import com.github.lisama569.ordermatchingenginejava.journal.JournalEvent;
 import com.github.lisama569.ordermatchingenginejava.market.MarketDataService;
 import com.github.lisama569.ordermatchingenginejava.market.SimulatedMarketFeeder;
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.CancelOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Fill;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
@@ -67,6 +69,18 @@ public final class OrderService {
         return result;
     }
 
+    /** 改单入口：先持久化、后执行（重放阶段不重复追加日志）。 */
+    public AmendOrderResult amend(AmendOrderRequest req) {
+        if (!replaying) {
+            journal.append(JournalEvent.amend(req));
+        }
+        AmendOrderResult result = engine.amend(req);
+        log.info("[service] amend amendId={} account={} clientOrderId={} success={} duplicate={} reason={}",
+                req.amendId(), req.accountId(), req.clientOrderId(),
+                result.success(), result.duplicate(), result.rejectReason());
+        return result;
+    }
+
     /** 行情入口（由 MarketDataService 回调）：先持久化、后撮合。 */
     public TickResult acceptTick(MarketTick tick) {
         if (!replaying) {
@@ -87,7 +101,7 @@ public final class OrderService {
         replaying = true;
         try {
             List<JournalEvent> events = journal.readAll();
-            int submits = 0, cancels = 0, ticks = 0;
+            int submits = 0, cancels = 0, amends = 0, ticks = 0;
             for (JournalEvent e : events) {
                 switch (e.type()) {
                     case SUBMIT -> {
@@ -98,6 +112,10 @@ public final class OrderService {
                         engine.cancel(e.cancelAccountId(), e.cancelClientOrderId());
                         cancels++;
                     }
+                    case AMEND -> {
+                        engine.amend(e.amend());
+                        amends++;
+                    }
                     case TICK -> {
                         TickResult r = engine.onTick(e.tick());
                         marketDataService.resetExpectedSeq(e.tick().symbol(), r.expectedSeq());
@@ -105,8 +123,8 @@ public final class OrderService {
                     }
                 }
             }
-            log.info("[service] replay done events={} (submits={}, cancels={}, ticks={})",
-                    events.size(), submits, cancels, ticks);
+            log.info("[service] replay done events={} (submits={}, cancels={}, amends={}, ticks={})",
+                    events.size(), submits, cancels, amends, ticks);
             return events.size();
         } finally {
             replaying = false;

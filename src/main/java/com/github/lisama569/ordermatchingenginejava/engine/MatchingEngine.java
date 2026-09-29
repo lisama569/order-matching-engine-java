@@ -1,6 +1,8 @@
 package com.github.lisama569.ordermatchingenginejava.engine;
 
 import com.github.lisama569.ordermatchingenginejava.account.AccountLedger;
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.CancelOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Fill;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
@@ -25,18 +27,23 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.concurrent.locks.ReentrantLock;
 
+
 /**
  * 撮合与执行核心。
  *
- * <p>线程模型：单把锁串行化所有状态变更（下单 / 撤单 / 行情 / 重放），
+ * <p>线程模型：单把锁串行化所有状态变更（下单 / 撤单 / 改单 / 行情 / 重放），
  * 保证并发下的占用守恒与成交确定性。锁内不做 IO（日志写入在 OrderService
  * 层于调用前完成），避免临界区阻塞。
  *
- * <p>幂等：clientOrderId 是下单幂等键、(accountId,clientOrderId) 是撤单幂等键，
- * 重复请求返回首次结果，不产生任何额外占用或成交。
+ * <p>幂等：clientOrderId 是下单幂等键、(accountId,clientOrderId) 是撤单幂等键、
+ * (accountId,clientOrderId,amendId) 是改单幂等键；重复请求返回首次结果，
+ * 不产生任何额外占用、占用调整或成交。
  *
- * <p>确定性：订单入队序号、成交流水序号、每个标的的行情期望序号均为单调计数；
- * 启动时按 WAL 原序回放即可得到与停机前一致的订单簿、台账与成交结果。
+ * <p>改单：改价（含市价单改保护价）按改单时刻刷新入队序号并重新排队、失去原时间优先；
+ * 只改量不改价保留原排队先后。占用按剩余数量做原子差额调整，追加不足则整体零改动。
+ *
+ * <p>确定性：订单入队序号（含改价重排队的新序号）、成交流水序号、每个标的的行情期望序号
+ * 均为单调计数；启动时按 WAL 原序回放即可得到与停机前一致的订单簿、台账与成交结果。
  */
 public final class MatchingEngine {
 
@@ -51,6 +58,7 @@ public final class MatchingEngine {
     private final Map<String, Order> byClientOrderId = new HashMap<>();
     private final Map<String, SubmitOrderResult> submitResults = new HashMap<>();
     private final Map<String, CancelOrderResult> cancelResults = new HashMap<>();
+    private final Map<String, AmendOrderResult> amendResults = new HashMap<>();
     /** symbol -> 下一个期望行情序号（首个接受的序号必须为 1）。 */
     private final Map<String, Long> expectedTickSeq = new HashMap<>();
     private final List<Fill> fills = new ArrayList<>();
@@ -210,6 +218,116 @@ public final class MatchingEngine {
         cancelResults.put(key, r);
         log.warn("[cancel] rejected account={} clientOrderId={} reason={} because={}",
                 accountId, clientOrderId, reason, message);
+        return r;
+    }
+
+    /**
+     * 改单（命令已由上层写入 WAL）。
+     *
+     * <p>幂等：以 {@code (accountId, clientOrderId, amendId)} 为键，重复请求返回首次结果。
+     *
+     * <p>占用守恒：按"剩余数量"比较新旧需求。需要追加占用时若可用现金/持仓/敞口不足，
+     * 整体拒绝，订单价格、数量、已占用额度均不变；需求减少时立即释放多占用部分。
+     *
+     * <p>排队：改价（含市价单改保护价）按改单时刻刷新入队序号并重新排队，失去原时间优先；
+     * 只减量不改价保留原排队先后。
+     */
+    public AmendOrderResult amend(AmendOrderRequest req) {
+        lock.lock();
+        try {
+            String key = req.accountId() + '|' + req.clientOrderId() + '|' + req.amendId();
+            AmendOrderResult first = amendResults.get(key);
+            if (first != null) {
+                log.info("[amend] idempotent-hit amendId={} account={} clientOrderId={} success={} reason={}",
+                        req.amendId(), req.accountId(), req.clientOrderId(),
+                        first.success(), first.rejectReason());
+                return new AmendOrderResult(first.success(), true, first.orderId(), first.status(),
+                        first.price(), first.quantity(), first.rejectReason(), first.message());
+            }
+
+            if (req.amendId() == null || req.amendId().isBlank()
+                    || req.accountId() == null || req.accountId().isBlank()
+                    || req.clientOrderId() == null || req.clientOrderId().isBlank()) {
+                return rejectAmend(key, null, OrderStatus.REJECTED,
+                        RejectReason.INVALID_ARGUMENT, "amend request missing required fields");
+            }
+
+            Order order = byClientOrderId.get(req.clientOrderId());
+            if (order == null) {
+                return rejectAmend(key, null, OrderStatus.REJECTED,
+                        RejectReason.ORDER_NOT_FOUND, "order not found");
+            }
+            if (!order.getAccountId().equals(req.accountId())) {
+                return rejectAmend(key, order.getOrderId(), order.getStatus(),
+                        RejectReason.ORDER_OWNER_MISMATCH, "order belongs to another account");
+            }
+            if (order.getStatus() != OrderStatus.NEW && order.getStatus() != OrderStatus.PARTIALLY_FILLED) {
+                return rejectAmend(key, order.getOrderId(), order.getStatus(),
+                        RejectReason.ORDER_NOT_AMENDABLE,
+                        "order status " + order.getStatus() + " is not amendable");
+            }
+
+            RejectReason invalid = risk.validateAmend(req, order.getType(), order.getFilledQty());
+            if (invalid != null) {
+                return rejectAmend(key, order.getOrderId(), order.getStatus(), invalid,
+                        "amend static risk check failed");
+            }
+
+            long oldPrice = order.getPrice();
+            long oldTotal = order.getOriginalQty();
+            long newPrice = req.newPrice() != null ? req.newPrice() : oldPrice;
+            long oldRemaining = order.remainingQty();
+            long newTotal = req.newQuantity() != null ? req.newQuantity() : oldTotal;
+            long newRemaining = newTotal - order.getFilledQty();
+
+            long oldNotional = oldRemaining * oldPrice;
+            long newNotional = newRemaining * newPrice;
+
+            // 原子调整占用：任何追加额度不足都返回 false，台账零改动
+            boolean adjusted = order.getSide() == Side.BUY
+                    ? ledger.adjustBuy(order.getAccountId(), order.getSymbol(), newNotional - oldNotional)
+                    : ledger.adjustSell(order.getAccountId(), order.getSymbol(),
+                            newRemaining - oldRemaining, newNotional - oldNotional);
+            if (!adjusted) {
+                return rejectAmend(key, order.getOrderId(), order.getStatus(),
+                        RejectReason.EXPOSURE_LIMIT_EXCEEDED,
+                        "insufficient cash/position or exposure limit for amended order");
+            }
+
+            // 占用调整成功后再更新订单：改价重排队，改量原地保留优先级。
+            // 只要请求显式带了新价格（即使数值与原价相同）即视为改价，按改单时刻重新排队。
+            // 必须先更新价格/入队序号字段，再从堆中移除并以新排序键重新入堆。
+            boolean priceChanged = req.newPrice() != null;
+            if (priceChanged) {
+                long newEnqueueSeq = enqueueSeq.incrementAndGet();
+                order.applyPriceChange(newPrice, newEnqueueSeq);
+                book(order.getSymbol()).requeue(order);
+            }
+            if (req.newQuantity() != null) {
+                order.applyQuantityChange(newTotal);
+            }
+
+            AmendOrderResult ok = new AmendOrderResult(true, false, order.getOrderId(),
+                    order.getStatus(), order.getPrice(), order.getOriginalQty(), null,
+                    priceChanged ? "order amended, re-queued at new price"
+                            : "order amended, time priority retained");
+            amendResults.put(key, ok);
+            log.info("[amend] accepted amendId={} orderId={} account={} clientOrderId={} price {}->{} totalQty {}->{} filled={} remaining={} requeued={}",
+                    req.amendId(), order.getOrderId(), req.accountId(), req.clientOrderId(),
+                    oldPrice, order.getPrice(), oldTotal, order.getOriginalQty(),
+                    order.getFilledQty(), order.remainingQty(), priceChanged);
+            return ok;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private AmendOrderResult rejectAmend(String key, Long orderId, OrderStatus status,
+                                         RejectReason reason, String message) {
+        AmendOrderResult r = new AmendOrderResult(false, false, orderId, status,
+                null, null, reason, message);
+        amendResults.put(key, r);
+        log.warn("[amend] rejected key={} orderId={} reason={} because={}", key, orderId, reason, message);
         return r;
     }
 

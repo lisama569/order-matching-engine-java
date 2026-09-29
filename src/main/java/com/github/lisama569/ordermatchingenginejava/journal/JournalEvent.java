@@ -1,5 +1,6 @@
 package com.github.lisama569.ordermatchingenginejava.journal;
 
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderRequest;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
 import com.github.lisama569.ordermatchingenginejava.model.SubmitOrderRequest;
 
@@ -10,23 +11,29 @@ import com.github.lisama569.ordermatchingenginejava.model.SubmitOrderRequest;
  * @param submit SUBMIT 命令体
  * @param cancelAccountId CANCEL 的账户
  * @param cancelClientOrderId CANCEL 的客户订单号
+ * @param amend  AMEND 命令体
  * @param tick   TICK 行情
  */
 public record JournalEvent(EventType type,
                            SubmitOrderRequest submit,
                            String cancelAccountId,
                            String cancelClientOrderId,
+                           AmendOrderRequest amend,
                            MarketTick tick) {
 
     public static JournalEvent submit(SubmitOrderRequest req) {
-        return new JournalEvent(EventType.SUBMIT, req, null, null, null);
+        return new JournalEvent(EventType.SUBMIT, req, null, null, null, null);
     }
 
     public static JournalEvent cancel(String accountId, String clientOrderId) {
-        return new JournalEvent(EventType.CANCEL, null, accountId, clientOrderId, null);
+        return new JournalEvent(EventType.CANCEL, null, accountId, clientOrderId, null, null);
+    }
+
+    public static JournalEvent amend(AmendOrderRequest req) {
+        return new JournalEvent(EventType.AMEND, null, null, null, req, null);
     }
 
     public static JournalEvent tick(MarketTick tick) {
-        return new JournalEvent(EventType.TICK, null, null, null, tick);
+        return new JournalEvent(EventType.TICK, null, null, null, null, tick);
     }
 }

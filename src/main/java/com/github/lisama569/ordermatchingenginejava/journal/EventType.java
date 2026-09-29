@@ -4,5 +4,6 @@ package com.github.lisama569.ordermatchingenginejava.journal;
 public enum EventType {
     SUBMIT,
     CANCEL,
+    AMEND,
     TICK
 }

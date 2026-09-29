@@ -2,9 +2,12 @@ package com.github.lisama569.ordermatchingenginejava.api;
 
 import com.github.lisama569.ordermatchingenginejava.account.AccountLedger;
 import com.github.lisama569.ordermatchingenginejava.account.AccountSnapshot;
+import com.github.lisama569.ordermatchingenginejava.api.dto.AmendOrderDto;
 import com.github.lisama569.ordermatchingenginejava.api.dto.CancelOrderDto;
 import com.github.lisama569.ordermatchingenginejava.api.dto.SubmitOrderDto;
 import com.github.lisama569.ordermatchingenginejava.api.dto.TickDto;
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderRequest;
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.CancelOrderResult;
 import com.github.lisama569.ordermatchingenginejava.model.Fill;
 import com.github.lisama569.ordermatchingenginejava.model.MarketTick;
@@ -65,9 +68,22 @@ public class OrderController {
         return ResponseEntity.status(status).body(result);
     }
 
+    /** 改单（幂等：相同 amendId 重复提交只生效一次）。 */
+    @PostMapping("/orders/amend")
+    public ResponseEntity<AmendOrderResult> amend(@RequestBody AmendOrderDto dto) {
+        log.info("[api] POST /orders/amend body={}", dto);
+        requireText(dto.amendId(), "amendId");
+        requireText(dto.accountId(), "accountId");
+        requireText(dto.clientOrderId(), "clientOrderId");
+        AmendOrderRequest req = new AmendOrderRequest(dto.amendId(), dto.accountId(),
+                dto.clientOrderId(), dto.newPrice(), dto.newQuantity());
+        AmendOrderResult result = orderService.amend(req);
+        HttpStatus status = result.success() ? HttpStatus.OK : HttpStatus.UNPROCESSABLE_ENTITY;
+        return ResponseEntity.status(status).body(result);
+    }
+
     /** 推送行情（序号必须连续，重复/乱序/断层被拒绝并给出可区分原因）。 */
-    @PostMapping("/market/ticks")
-    public ResponseEntity<TickResult> tick(@RequestBody TickDto dto) {
+    @PostMapping("/market/ticks")    public ResponseEntity<TickResult> tick(@RequestBody TickDto dto) {
         log.info("[api] POST /market/ticks body={}", dto);
         if (dto.seq() == null || dto.seq() <= 0) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "tick.seq must be positive");

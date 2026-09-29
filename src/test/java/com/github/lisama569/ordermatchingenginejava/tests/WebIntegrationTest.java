@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -16,12 +17,16 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * REST 端到端：HTTP 状态码 + 可区分拒因 + 幂等标记 + 行情序号拒绝。
- * 注意：本测试依赖默认种子账户 alice/bob 与标的 AAPL，且与其他用例共享
- * target/test-data/journal.jsonl；断言只依赖拒因/标志，不依赖历史计数。
+ * REST 端到端：HTTP 状态码 + 可区分拒因 + 幂等标记 + 行情序号拒绝 + 改单。
+ * 注意：本测试使用<b>独立 WAL 且关闭启动回放</b>，使其可连续多次重复执行而不被
+ * 上一轮历史污染（回放正确性由 {@code ReplayTest} 用独立临时 WAL 专门覆盖）。
  */
 @SpringBootTest
 @AutoConfigureMockMvc
+@TestPropertySource(properties = {
+        "matching.journal-path=target/test-data/web-journal.jsonl",
+        "matching.replay-on-startup=false"
+})
 class WebIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger(WebIntegrationTest.class);
@@ -106,5 +111,60 @@ class WebIntegrationTest {
                 .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
         log.info("[web] 重复撤单: duplicate={}", M.readTree(cancelDup).get("duplicate").asBoolean());
         org.junit.jupiter.api.Assertions.assertTrue(M.readTree(cancelDup).get("duplicate").asBoolean());
+    }
+
+    @Test
+    void amendHttpFlow() throws Exception {
+        // bob 下限价买单 10@100，冻结 1000
+        String buy = orderJson("web-amend-buy", "bob", "BUY", "LIMIT", 100L, null, 10);
+        mvc.perform(post("/api/orders").contentType(MediaType.APPLICATION_JSON).content(buy))
+                .andExpect(status().isOk());
+
+        // 只改量到 20 => 200，body 反映新数量，冻结升到 2000
+        String amendQty = M.createObjectNode()
+                .put("amendId", "web-amend-qty").put("accountId", "bob")
+                .put("clientOrderId", "web-amend-buy").put("newQuantity", 20).toString();
+        String qtyResp = mvc.perform(post("/api/orders/amend").contentType(MediaType.APPLICATION_JSON).content(amendQty))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        JsonNode qtyNode = M.readTree(qtyResp);
+        log.info("[web] 改量响应: success={} price={} quantity={}",
+                qtyNode.get("success").asBoolean(), qtyNode.get("price").asLong(), qtyNode.get("quantity").asLong());
+        org.junit.jupiter.api.Assertions.assertTrue(qtyNode.get("success").asBoolean());
+        org.junit.jupiter.api.Assertions.assertEquals(20, qtyNode.get("quantity").asLong());
+
+        String exp = mvc.perform(get("/api/accounts/bob/symbols/AAPL/exposure"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertEquals(2000, M.readTree(exp).get("cashReserved").asLong());
+
+        // 同一改单请求重复提交 => 200 + duplicate=true，占用不变
+        String dupResp = mvc.perform(post("/api/orders/amend").contentType(MediaType.APPLICATION_JSON).content(amendQty))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertTrue(M.readTree(dupResp).get("duplicate").asBoolean());
+
+        // 改价到 100（显式改价）=> 成功
+        String amendPrice = M.createObjectNode()
+                .put("amendId", "web-amend-price").put("accountId", "bob")
+                .put("clientOrderId", "web-amend-buy").put("newPrice", 100).toString();
+        mvc.perform(post("/api/orders/amend").contentType(MediaType.APPLICATION_JSON).content(amendPrice))
+                .andExpect(status().isOk());
+
+        // 改不存在的订单 => 422 + ORDER_NOT_FOUND
+        String amendMissing = M.createObjectNode()
+                .put("amendId", "web-amend-missing").put("accountId", "bob")
+                .put("clientOrderId", "no-such-order").put("newPrice", 100).toString();
+        String missResp = mvc.perform(post("/api/orders/amend").contentType(MediaType.APPLICATION_JSON).content(amendMissing))
+                .andExpect(status().isUnprocessableEntity()).andReturn().getResponse().getContentAsString();
+        log.info("[web] 改单不存在响应: reason={}", M.readTree(missResp).get("rejectReason").asText());
+        org.junit.jupiter.api.Assertions.assertEquals("ORDER_NOT_FOUND",
+                M.readTree(missResp).get("rejectReason").asText());
+
+        // 不改价也不改量 => 422 + AMEND_NO_CHANGE
+        String amendNone = M.createObjectNode()
+                .put("amendId", "web-amend-none").put("accountId", "bob")
+                .put("clientOrderId", "web-amend-buy").toString();
+        String noneResp = mvc.perform(post("/api/orders/amend").contentType(MediaType.APPLICATION_JSON).content(amendNone))
+                .andExpect(status().isUnprocessableEntity()).andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertEquals("AMEND_NO_CHANGE",
+                M.readTree(noneResp).get("rejectReason").asText());
     }
 }

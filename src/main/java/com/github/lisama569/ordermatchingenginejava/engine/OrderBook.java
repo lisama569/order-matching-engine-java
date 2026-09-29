@@ -76,6 +76,18 @@ public final class OrderBook {
         queueOf(order.getSide()).remove(order);
     }
 
+    /**
+     * 改价后重新排队。<b>调用方必须先更新订单的价格/入队序号字段，再调用本方法</b>：
+     * 先从原队列按身份移除（PriorityQueue.remove 用 equals，不依赖比较键），
+     * 再以新的价格/入队序号重新入堆，从而按改单时刻失去原来的时间优先。
+     * 只改量不改价时不应调用本方法（保留原 enqueueSeq 与队列位置）。
+     */
+    public void requeue(Order order) {
+        PriorityQueue<Order> q = queueOf(order.getSide());
+        q.remove(order);
+        q.add(order);
+    }
+
     private PriorityQueue<Order> queueOf(Side side) {
         return side == Side.BUY ? bids : asks;
     }

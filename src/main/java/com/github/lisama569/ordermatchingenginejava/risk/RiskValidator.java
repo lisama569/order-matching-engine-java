@@ -1,5 +1,6 @@
 package com.github.lisama569.ordermatchingenginejava.risk;
 
+import com.github.lisama569.ordermatchingenginejava.model.AmendOrderRequest;
 import com.github.lisama569.ordermatchingenginejava.model.OrderType;
 import com.github.lisama569.ordermatchingenginejava.model.RejectReason;
 import com.github.lisama569.ordermatchingenginejava.model.SubmitOrderRequest;
@@ -54,6 +55,40 @@ public final class RiskValidator {
             }
         } else {
             return RejectReason.INVALID_ARGUMENT;
+        }
+        return null;
+    }
+
+    /**
+     * 改单静态校验。{@code filledQty} 为订单已成交数量（新总数量必须大于它）。
+     * 校验内容：请求体必填、必须至少改价或改量之一、新价为正且符合刻度、
+     * 新量为正、整手且大于已成交数量。
+     *
+     * @return 拒因；通过返回 null
+     */
+    public RejectReason validateAmend(AmendOrderRequest req, OrderType type, long filledQty) {
+        if (req == null || isBlank(req.amendId()) || isBlank(req.accountId())
+                || isBlank(req.clientOrderId())) {
+            return RejectReason.INVALID_ARGUMENT;
+        }
+        boolean priceTouched = req.newPrice() != null;
+        boolean qtyTouched = req.newQuantity() != null;
+        if (!priceTouched && !qtyTouched) {
+            return RejectReason.AMEND_NO_CHANGE;
+        }
+        if (priceTouched) {
+            long p = req.newPrice();
+            if (p <= 0 || p % tickSize != 0) {
+                return type == OrderType.MARKET
+                        ? RejectReason.INVALID_PROTECTION_PRICE
+                        : RejectReason.AMEND_INVALID_PRICE;
+            }
+        }
+        if (qtyTouched) {
+            long q = req.newQuantity();
+            if (q <= 0 || q % lotSize != 0 || q <= filledQty) {
+                return RejectReason.AMEND_INVALID_QUANTITY;
+            }
         }
         return null;
     }

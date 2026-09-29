@@ -12,14 +12,14 @@ public final class Order {
     private final String symbol;
     private final Side side;
     private final OrderType type;
-    /** 限价单：限价；市价单：客户提供的保护价（买单冻结资金 / 卖单防穿仓）。 */
-    private final long price;
-    private final long originalQty;
+    /** 限价单：限价；市价单：客户提供的保护价（买单冻结资金 / 卖单防穿仓）。改价时可变。 */
+    private long price;
+    private long originalQty;
     private long filledQty;
     private OrderStatus status;
     private RejectReason rejectReason;
-    /** 进入订单簿的逻辑序号，决定同一价格档位内的时间优先。 */
-    private final long enqueueSeq;
+    /** 进入订单簿的逻辑序号，决定同一价格档位内的时间优先。改价重排队时刷新。 */
+    private long enqueueSeq;
 
     public Order(long orderId, String clientOrderId, String accountId, String symbol, Side side,
                  OrderType type, long price, long originalQty, long enqueueSeq) {
@@ -55,4 +55,15 @@ public final class Order {
     public RejectReason getRejectReason() { return rejectReason; }
     public void setRejectReason(RejectReason rejectReason) { this.rejectReason = rejectReason; }
     public long getEnqueueSeq() { return enqueueSeq; }
+
+    /** 改价（限价单=限价，市价单=保护价），同时按改单时刻刷新排队序号，失去原时间优先。 */
+    public void applyPriceChange(long newPrice, long newEnqueueSeq) {
+        this.price = newPrice;
+        this.enqueueSeq = newEnqueueSeq;
+    }
+
+    /** 改量（新的订单总数量，含已成交部分）；只改量不改价时排队序号不变，保留时间优先。 */
+    public void applyQuantityChange(long newQty) {
+        this.originalQty = newQty;
+    }
 }
