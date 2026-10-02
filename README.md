@@ -1,7 +1,14 @@
 # 本地限价单撮合与执行服务（order-matching-engine-java）
 
 进程内、可并发访问的限价/市价单撮合服务。用模拟行情流驱动撮合，
-以命令流水（WAL）保证**重复请求、乱序行情、服务重启**后的成交结论一致且可解释。
+以命令流水（WAL）保证**重复请求、乱序行情、服务重启、并发混打**后的成交结论一致且可解释。
+
+> **并发重启一致性（本次修复）**：下单 / 撤单 / 改单 / 行情即使在多线程下同时打进来，
+> 每条命令也在同一把**命令锁**内原子地完成「先追加 WAL、后执行引擎」。
+> 因此 WAL 的命令先后次序与引擎实际执行次序（订单号、入队序号、成交序号、
+> 占用差额的归属次序）严格一致；无论并发如何交错，重启后按 WAL 原序回放都能
+> **逐项**复现停机前的订单簿挂单、盘口排队先后、账户占用、成交流水与行情进度。
+> 同一份历史连续回放、同一个用例反复多跑，结果都稳定相同（见下文 `ConcurrentReplayTest`）。
 
 ## 快速开始
 
@@ -47,20 +54,37 @@ curl -s -X POST localhost:8080/api/orders/amend -H 'Content-Type: application/js
 ## 架构
 
 ```
-HTTP ─ OrderController ── OrderService（WAL write-ahead + 回放编排）
+HTTP ─ OrderController ── OrderService（命令锁：WAL write-ahead + 引擎执行 原子串行；回放编排）
                               │
         ┌─────────────────────┼──────────────────────────┐
    MatchingEngine        AccountLedger              MarketDataService
    （全局锁串行化：        （资金/持仓/占用台账，      SimulatedMarketFeeder
-    下单/撤单/改单/行情）  敞口上限，守恒校验）        （进程内模拟行情源）
-        │
+    下单/撤单/改单/行情）  敞口上限，守恒校验）        （进程内模拟行情源；
+        │                                              回放后序号自动对齐）
    OrderBook（单标的：价格优先、时间优先、市价单优先；改价重排队）
 ```
 
-- **线程模型**：`MatchingEngine` 用一把可重入锁串行化所有状态变更（含改单）；
-  锁内不做 IO，WAL 追加在锁外（OrderService 先写日志再进引擎）。
+- **线程模型（两层锁）**：
+  - `OrderService` 的**命令锁**把「WAL 追加 + 引擎执行」串行化为一个不可分割的
+    线性化点，保证 WAL 序与执行序一致——这是并发混打后重启回放不产生分叉的关键。
+    若两步分别加锁，线程 A 可能先抢到日志锁、线程 B 先抢到引擎锁，造成
+    "日志里 A 在 B 前、执行上 B 在 A 前"，回放必然分叉。
+  - `MatchingEngine` 用一把可重入锁串行化所有状态变更（含改单与行情撮合），
+    锁内不做磁盘 IO；`OrderBook` / `AccountLedger` 只在该锁内被访问。
+  - 回放（`OrderService.replay()`）与在线命令共用同一把命令锁，回放期间不会有
+    命令插入；回放只驱动引擎、不再追加 WAL。
 - **确定性**：订单号、入队序号（含改价重排队产生的新序号）、成交序号、行情期望序号
-  都是引擎实例内的单调计数；同一命令序列必然产生同一状态序列，因此重放可逐字节复现。
+  都是引擎实例内的单调计数。并发命令的"谁先谁后"由它在命令锁上获得的先后
+  （= WAL 行序）唯一确定；一旦历史落盘，重放就是确定的同一命令序列，
+  必然产生同一状态序列，因此可逐笔复现停机前状态。
+- **并发下的"谁最后生效"**：几笔并发改单（不同 `amendId`）打在同一张挂单或
+  相邻挂单上时，最终生效的价格、数量与排队顺序由 WAL 行序中**最后一条被接受的
+  改单**唯一决定，回放得到完全相同的结果。对象不存在、不属于该账户、
+  已全部成交 / 已撤销 / 已拒绝、改后价量非法、追加占用不足等命令在并发下同样
+  被叫停：不改动订单、不调整占用，回放时也产生相同的叫停结论，不会导致分叉。
+- **行情进度**：回放不仅恢复引擎的期望序号，也会把 `SimulatedMarketFeeder`
+  的本地序号计数器同步到回放进度，重启后自动/模拟行情从正确序号继续，
+  不会从 1 重新编号而被判乱序。
 
 ## 撮合优先级
 
@@ -131,16 +155,33 @@ HTTP ─ OrderController ── OrderService（WAL write-ahead + 回放编排）
 ## 行情序号与重放语义
 
 - 每个标的的行情序号从 1 开始必须严格连续（`expectedSeq` 由引擎维护）。
-- 所有命令（下单/撤单/**改单**/行情，含将被拒绝的）**先追加 WAL、后执行**；
-  被拒命令不改变状态，因此重放时得到相同的拒绝结论，状态演化一致。
+- 所有命令（下单/撤单/**改单**/行情，含将被拒绝的）**在同一命令锁内先追加 WAL、
+  后执行**；被拒命令不改变状态，因此重放时得到相同的拒绝结论，状态演化一致。
+  并发场景下命令获得命令锁的先后就是 WAL 行序，也就是引擎执行序，二者不可能错位。
 - 改单命令完整记录 `amendId / accountId / clientOrderId / newPrice / newQuantity`，
   回放时按原序重新执行：改价重排队产生的**新入队序号**、只改量保留的**原序号**、
-  价格/数量、占用增减、成交结果与幂等结论都会逐字节复现，因此重启后订单簿挂单与优先级、
+  价格/数量、占用增减、成交结果与幂等结论都会逐笔复现，因此重启后订单簿挂单与优先级、
   账户占用、成交流水、行情进度与停机前一致。WAL 的 `AMEND` 记录是**向后兼容追加**：
-  JSON 中新增 `amend` 字段，旧的 SUBMIT/CANCEL/TICK 行仍可正常反序列化。
+  JSON 中新增 `amend` 字段，旧的 SUBMIT/CANCEL/TICK 行仍可正常反序列化；
+  本次修复**没有改动 WAL 文件格式**，之前已落盘的历史可照常加载回放。
+- 回放结束后 `MarketDataService` 的期望序号与 `SimulatedMarketFeeder` 的本地计数器
+  都被同步到历史进度，随后的行情（含重启后的自动行情）从正确序号继续。
 - 启动时 `BootstrapSeeder` 先加载种子配置（账户/持仓/敞口，属配置基线不进 WAL），
   再按 WAL 原序回放命令，重建订单簿、台账、占用、成交流水与行情期望序号。
 - 删除 `data/journal.jsonl` 即清空全部命令历史（种子配置仍在）。
+
+## 并发重启一致性的保证范围
+
+- **保证**：在单进程内，下单 / 撤单 / 改单 / 行情任意并发交错后，
+  以 WAL 为唯一历史重启回放，得到的下列结果与停机前**逐项一致**且重复回放稳定：
+  成交流水（序号、触发行情、价、量、买卖双方）、每张订单的价/总量/已成交量/状态/
+  入队序号、买卖盘口排队先后、每个账户的现金/持仓/冻结/敞口、各标的行情期望序号。
+- **保证**：占用在并发下守恒——在簿买单剩余名义之和 == 冻结现金、
+  在簿卖单剩余持仓之和 == 冻结持仓、在簿挂单名义之和 == 敞口；
+  追加占用不足的改单整体被叫停、零改动；不存在多占、漏放、双花。
+- **不保证 / 范围之外**：不同并发交错（即不同的 WAL 行序）之间结果本就可能不同，
+  系统保证的是"**同一份历史**必然重放出同一结果"，而非任意两次运行逐位相同；
+  跨进程 / 多实例共享同一 WAL 文件的复制与协调不在本单机实现范围内。
 
 ## 配置（application.properties）
 
@@ -159,11 +200,15 @@ HTTP ─ OrderController ── OrderService（WAL write-ahead + 回放编排）
 ## 测试
 
 ```bash
-mvn test            # 全部 36 个用例
-mvn -Dtest=AmendOrderTest test        # 改单引擎专项
-mvn -Dtest=AmendReplayTest test       # 改单重启回放专项
-mvn -Dtest=AmendConcurrencyTest test  # 改单并发专项
-mvn -Dtest=ConcurrencyTest test       # 下单/撮合并发专项
+mvn test            # 全部 38 个用例
+mvn -Dtest=AmendOrderTest test          # 改单引擎专项
+mvn -Dtest=AmendReplayTest test         # 改单重启回放专项
+mvn -Dtest=AmendConcurrencyTest test    # 改单并发（直接打引擎）专项
+mvn -Dtest=ConcurrentReplayTest test    # 并发混打 + 重启回放一致性专项（本次新增）
+mvn -Dtest=ConcurrencyTest test         # 下单/撮合并发专项
+
+# 反复多次跑，确认并发用例稳定不偶发（同一用例内本身也连跑 12 轮独立 WAL）
+for i in $(seq 1 10); do mvn -Dtest=ConcurrentReplayTest test; done
 ```
 
 - `OrderBookTest`：价格/时间/市价单优先级、保护价边界、部分成交连续撮合。
@@ -176,10 +221,26 @@ mvn -Dtest=ConcurrencyTest test       # 下单/撮合并发专项
   重启回放后订单价/量/状态/**入队序号**、双方台账、成交流水逐项一致，并验证回放后可继续撮合。
 - `AmendConcurrencyTest`：16 线程并发改单占用精确等于在簿需求（不多占/漏放/双花）、
   同一 amendId 并发重复提交恰好生效一次、32 线程把订单往超额改时全部被拒且不击穿敞口上限。
+  （该用例直接打引擎，不推真实行情、不做重启回放。）
+- **`ConcurrentReplayTest`（本次新增）**：真正通过 OrderService 写路径把下单 / 撤单 /
+  改单（不同 `amendId` 并发改价/改量打在同一张单与相邻单上）/ 行情（10 个命令线程 +
+  1 个行情线程，含重复行情）**并发混打**进同一份 WAL，含对象不存在、非属主、
+  已终结、价量非法等被叫停命令；然后：
+  1. 全新实例按 WAL 引擎直驱回放，逐笔比对成交流水、订单价/量/状态/入队序号、
+     买卖盘口排队先后、四个账户-标的台账、行情期望序号；
+  2. 第二实例再回放一次（连续回放稳定）；
+  3. 第三实例用空 WAL 走"在线公开入口"把历史再喂一遍（公开写路径与回放路径结论一致，
+     且新产生的 WAL 与原历史同构）；
+  4. 验证占用守恒（在簿需求 == 冻结/敞口）、回放后行情可继续推进、
+     `SimulatedMarketFeeder` 回放后序号对齐。
+  整个用例连跑 12 轮（每轮独立 WAL、交错不同），任一轮分叉即失败。
 - `ConcurrencyTest`：32 线程并发下单敞口不击穿、16 线程重复提交恰好一笔占用、
   双边并发撮合下现金/持仓总量守恒。
 - `ReplayTest`：含成交/撤单/重复提交/乱序行情的命令历史，重启回放后
   成交流水、订单状态、台账、行情期望序号逐项一致。
+- `JournalBackwardCompatTest`：用仓库中既有、旧版本落盘的 WAL 文件
+  （含 SUBMIT/CANCEL/AMEND/TICK 四类记录）在新代码下只读复制回放，
+  验证历史格式照常可读、连续回放结论一致。
 - `WebIntegrationTest`：REST 端到端（HTTP 状态码 + 拒因 + 幂等标记），含改价/改量/
   改单拒因/改单幂等；该测试使用独立 WAL 且关闭启动回放，可连续多次重复执行。
 
@@ -208,4 +269,45 @@ curl -s -X POST localhost:8080/api/orders/amend -H 'Content-Type: application/js
   '{"amendId":"a-2","accountId":"alice","clientOrderId":"o-1","newPrice":99}'
 
 # 直接重启进程（Ctrl-C 后再次 mvn spring-boot:run），订单簿/优先级/占用按 data/journal.jsonl 回放复原
+```
+
+## 本地验证"并发混打 + 重启回放一致"
+
+自动化用例（内含 10 个命令线程 + 1 个行情线程、连跑 12 轮独立 WAL，
+逐笔比对成交流水 / 订单价量 / 排队顺序 / 账户占用 / 行情进度）：
+
+```bash
+# 单次
+mvn -Dtest=ConcurrentReplayTest test
+
+# 反复多次跑（确认不偶发分叉），全部应稳定 BUILD SUCCESS
+for i in $(seq 1 10); do
+  echo "=== iteration $i ==="
+  mvn -Dtest=ConcurrentReplayTest test 2>&1 | grep -E 'Tests run|BUILD'
+done
+
+# 全量回归（下单/撤单/行情/回放/改单既有用例不回归），也可多跑几遍
+mvn test
+```
+
+手工验证（两个终端）：
+
+```bash
+# 终端 1：起服务
+rm -f data/journal.jsonl && mvn spring-boot:run
+
+# 终端 2：后台并发混入下单 / 改价 / 改量 / 撤单 / 行情
+for i in $(seq 1 20); do
+  curl -s -X POST localhost:8080/api/orders -H 'Content-Type: application/json' -d \
+    "{\"clientOrderId\":\"o-$i\",\"accountId\":\"alice\",\"symbol\":\"AAPL\",\"side\":\"BUY\",\"type\":\"LIMIT\",\"limitPrice\":100,\"quantity\":10}" &
+  curl -s -X POST localhost:8080/api/orders/amend -H 'Content-Type: application/json' -d \
+    "{\"amendId\":\"a-$i\",\"accountId\":\"alice\",\"clientOrderId\":\"o-$i\",\"newPrice\":99}" &
+  curl -s -X POST localhost:8080/api/market/ticks -H 'Content-Type: application/json' -d \
+    "{\"seq\":$i,\"symbol\":\"AAPL\",\"price\":100}" >/dev/null &
+done; wait
+curl -s localhost:8080/api/fills | jq .
+
+# 终端 1：Ctrl-C 后重新启动，比对 /api/fills、/api/orders/<cid>、
+# /api/accounts/<id>/symbols/AAPL/exposure，应与停机前逐项一致；
+# 行情序号也从停机处继续（再发下一个序号被接受、重复序号被判重）。
 ```

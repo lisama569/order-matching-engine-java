@@ -191,4 +191,22 @@ public final class OrderBook {
         }
         return n;
     }
+
+    /**
+     * 按撮合优先级（市价优先 → 价格优先 → 时间优先）返回该侧全部在簿有效订单。
+     * 仅在 MatchingEngine 全局锁内调用；基于堆副本弹出，不改变原队列。
+     */
+    public List<Order> restingInPriority(Side side) {
+        PriorityQueue<Order> copy = new PriorityQueue<>(
+                side == Side.BUY ? BID_CMP : ASK_CMP);
+        copy.addAll(queueOf(side));
+        List<Order> out = new ArrayList<>();
+        while (!copy.isEmpty()) {
+            Order o = copy.poll();
+            if (alive(o)) {
+                out.add(o);
+            }
+        }
+        return out;
+    }
 }

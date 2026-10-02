@@ -32,8 +32,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * 撮合与执行核心。
  *
  * <p>线程模型：单把锁串行化所有状态变更（下单 / 撤单 / 改单 / 行情 / 重放），
- * 保证并发下的占用守恒与成交确定性。锁内不做 IO（日志写入在 OrderService
- * 层于调用前完成），避免临界区阻塞。
+ * 保证并发下的占用守恒与成交确定性。锁内不做 IO：WAL 追加与引擎调用在
+ * {@code OrderService} 的命令锁内作为一个原子步骤完成（先追加后执行），
+ * 使 WAL 行序与引擎执行序严格一致，重启按 WAL 回放即可逐项复现停机前状态。
  *
  * <p>幂等：clientOrderId 是下单幂等键、(accountId,clientOrderId) 是撤单幂等键、
  * (accountId,clientOrderId,amendId) 是改单幂等键；重复请求返回首次结果，
@@ -429,6 +430,33 @@ public final class MatchingEngine {
         lock.lock();
         try {
             return Collections.unmodifiableList(new ArrayList<>(fills));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 按撮合优先级返回某标的某一侧的全部在簿有效订单（只读快照）。
+     * 列表顺序就是盘口排队先后，供快照比对使用。
+     */
+    public List<Order> restingOrders(String symbol, Side side) {
+        lock.lock();
+        try {
+            OrderBook b = books.get(symbol);
+            if (b == null) {
+                return List.of();
+            }
+            return List.copyOf(b.restingInPriority(side));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 引擎记录的某标的下一个期望行情序号（未见过的标的为 1）。 */
+    public long expectedTickSeq(String symbol) {
+        lock.lock();
+        try {
+            return expectedTickSeq.getOrDefault(symbol, 1L);
         } finally {
             lock.unlock();
         }
