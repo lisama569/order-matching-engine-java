@@ -191,4 +191,25 @@ public final class OrderBook {
         }
         return n;
     }
+
+    /**
+     * 按撮合优先级（市价优先 / 价格优先 / 时间优先）返回当前在簿有效订单。
+     * 通过逐个弹出再回填实现，<b>仅在 MatchingEngine 全局锁内调用</b>，
+     * 不改变任何订单状态与相对顺序（回填后堆结构与原堆等价）。
+     * 用于快照 / 测试中精确比对排队先后。
+     */
+    public List<Order> snapshotResting(Side side) {
+        PriorityQueue<Order> q = queueOf(side);
+        List<Order> resting = new ArrayList<>();
+        List<Order> taken = new ArrayList<>();
+        while (!q.isEmpty()) {
+            Order o = q.poll();
+            taken.add(o);
+            if (alive(o)) {
+                resting.add(o);
+            }
+        }
+        q.addAll(taken);
+        return resting;
+    }
 }

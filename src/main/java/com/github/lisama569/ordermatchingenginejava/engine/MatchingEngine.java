@@ -433,4 +433,34 @@ public final class MatchingEngine {
             lock.unlock();
         }
     }
+
+    /** 某标的下一个期望行情序号（引擎权威值，首个接受序号为 1）。 */
+    public long expectedTickSeq(String symbol) {
+        lock.lock();
+        try {
+            return expectedTickSeq.getOrDefault(symbol, 1L);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 返回某标的某方向在簿挂单的 clientOrderId，按当前撮合优先级排列
+     * （市价优先、价格优先、时间优先；含改价重排队后的先后）。
+     * 供快照/测试在引擎锁内读取一致的排队顺序。
+     */
+    public List<String> restingClientOrderIds(String symbol, Side side) {
+        lock.lock();
+        try {
+            List<String> ids = new ArrayList<>();
+            if (books.containsKey(symbol)) {
+                for (Order o : books.get(symbol).snapshotResting(side)) {
+                    ids.add(o.getClientOrderId());
+                }
+            }
+            return List.copyOf(ids);
+        } finally {
+            lock.unlock();
+        }
+    }
 }
